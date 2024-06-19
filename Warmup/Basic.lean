@@ -1,66 +1,14 @@
 import Lean
-import Lake
+import Warmup.Scratch
 
 open Lean Elab Command Tactic Meta
-
--- Declare new syntac for the declaration attribute
-syntax (name := addFooInst) "foobar" : attr
-
--- We first specify the types of the extension
--- Two type parameters: `α` is the type of data used to update the extention, `σ` is the type of data stored in the extension.
--- We need to specify two things: (i) how we incorporate sets/arrays of `α` (from multiple files) into a `σ`, and (ii) how we add individual `α`-terms to `σ` to the extension
--- First, let's define a helper function which incorporates an `Array` of data into an existing `HashSet`:
-
-def foldArrayIntoSet [BEq α] [Hashable α] (s : HashSet α) (a : Array α) : HashSet α :=
-  a.foldl HashSet.insert s
-
-def fooInstDecsr :
-  SimplePersistentEnvExtensionDescr Expr (HashSet Expr) := {
-  addImportedFn :=
-    Array.foldl (init := {}) foldArrayIntoSet
-  addEntryFn := HashSet.insert
-}
-
--- Next, initialize the extension
-initialize fooExtension : SimplePersistentEnvExtension Expr (HashSet Expr)
-  ← registerSimplePersistentEnvExtension fooInstDecsr
-
--- Now, we need to specify how the extension actually behaves from Lean syntax.
-
-initialize registerBuiltinAttribute {
-  name := `addFooInst
-  descr := "Something silly ."
-  applicationTime := .afterTypeChecking
-  add := fun declName stx _ => do
-    let `(attr| foobar ) := stx
-      | throwError "syntax error on : {stx}"
-    MetaM.run' do
-    -- get the current environment, look for the declaration which was tagged
-          let e ← getEnv
-          match e.find? declName with
-          | none => logError m!"[@foobar] error: could not find declaration {declName} in environment"
-          | some info => -- if found, update the extension
-            modifyEnv fun env =>
-                fooExtension.addEntry env info.type
-  }
-
-syntax "#showFoo" : command
-elab "#showFoo" : command => do
-  logInfo "Printing types of declarations tagged by @[foobar]:"
-  let decls := fooExtension.getState <| ← getEnv
-  for x in decls do
-    logInfo m!"{x}"
-  return ()
-
-
--- END OF EXAMPLE
 
 -- Our data type for holding information on theorem declarations.
 structure ThmData where
   -- Name of the theorem
   name : Name
   -- List of param_name × param_type
-  params : List (Name × Name)
+  params : Array (Name × Expr)
   -- LHS of the IFF
   lhs : Lean.Expr
   -- RHS of the IFF
@@ -93,14 +41,43 @@ def parseVal (params : List (Name × Name)) (body : Expr) : List (Name × Name) 
   | Expr.lam name (.const type _) body _ => parseVal ((name, type) :: params) body
   | _ => (params, body)
 
-def matchThm (thm : TheoremVal) : Option ThmData := do
-  let (params, prf) := parseVal [] thm.value
-  match parseType thm with
-  | some (lhs, rhs) => pure { name := thm.name, params := params, lhs := lhs, rhs := rhs, prf := prf }
-  | none => none
+-- def matchThm (thm : TheoremVal) : Option ThmData := do
+--   let (params, prf) := parseVal [] thm.value
+--   match parseType thm with
+--   | some (lhs, rhs) => pure { name := thm.name, params := params, lhs := lhs, rhs := rhs, prf := prf }
+--   | none => none
+
+def addVar (v : Expr) (arr : Array (Name × Expr)) : MetaM (Array (Name × Expr)) := do
+    let τ ← inferType v
+    match v with
+    | .fvar v =>
+      let nm ←  v.getUserName
+      return arr.push (nm,τ)
+    | _ => return arr
+
+def collectBvars (es : Array Expr) (e : Expr) : MetaM ((Array (Name × Expr)) × Expr) := do
+  let mut arr : Array (Name × Expr) := #[]
+  for v in es do
+    arr ← addVar v arr
+  return (arr, e)
+
+
+/- Note! -/
+def matchIffThm' (thm : TheoremVal) : MetaM (Option ThmData) := do
+  logInfo thm.type
+  -- note, in general this telescope will also collect premises of implications
+  let (bvars,e) ← forallTelescopeReducing thm.type (λ es e => collectBvars es e)
+  match e.getAppFn with
+  | .const `Iff _ =>
+    let args := e.getAppArgs
+    let lhs := args[0]!
+    let rhs := args[1]!
+    return some { name := thm.name, params := bvars, lhs := lhs, rhs := rhs, prf := thm.value}
+  | _ =>
+    return none
 
 def addThmToEnv (thm : TheoremVal) : MetaM Unit := do
-  match matchThm thm with
+  match ← matchIffThm' thm with
   | some thmData => modifyEnv fun env => parityExtension.addEntry env thmData
   | none => logError m!"Not an iff theorem."
 
@@ -119,13 +96,16 @@ initialize registerBuiltinAttribute {
           | some info => -- if found, update the extension
             match info with
             --| ConstantInfo.thmInfo thm => addThmToEnv thm
-            | ConstantInfo.thmInfo thm => logInfo m!"name: {thm.name}\nparams+prf: {parseVal [] thm.value}\ntype: {thm.type}"
+            | ConstantInfo.thmInfo thm =>
+                  logInfo m!"name: {thm.name}\nparams+prf: {parseVal [] thm.value}\ntype: {thm.type}"
+                  addThmToEnv thm
             | _ => logError m!"Not a theorem declaration."
 
   }
 
 syntax "#show_parity" : command
 elab "#show_parity" : command => do
+  logInfo "showing parity..."
   let decls := parityExtension.getState <| ← getEnv
   for x in decls do
     logInfo m!"---\nname: {x.name}\nparams: {x.params}\nlhs: {x.lhs}\nrhs: {x.rhs}\nprf: {x.prf}"
