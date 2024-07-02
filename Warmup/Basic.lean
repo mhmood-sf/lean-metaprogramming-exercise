@@ -3,69 +3,15 @@ import Lake
 
 open Lean Elab Command Tactic Meta
 
--- Declare new syntac for the declaration attribute
-syntax (name := addFooInst) "foobar" : attr
-
--- We first specify the types of the extension
--- Two type parameters: `α` is the type of data used to update the extention, `σ` is the type of data stored in the extension.
--- We need to specify two things: (i) how we incorporate sets/arrays of `α` (from multiple files) into a `σ`, and (ii) how we add individual `α`-terms to `σ` to the extension
--- First, let's define a helper function which incorporates an `Array` of data into an existing `HashSet`:
-
 def foldArrayIntoSet [BEq α] [Hashable α] (s : HashSet α) (a : Array α) : HashSet α :=
   a.foldl HashSet.insert s
 
-def fooInstDecsr :
-  SimplePersistentEnvExtensionDescr Expr (HashSet Expr) := {
-  addImportedFn :=
-    Array.foldl (init := {}) foldArrayIntoSet
-  addEntryFn := HashSet.insert
-}
-
--- Next, initialize the extension
-initialize fooExtension : SimplePersistentEnvExtension Expr (HashSet Expr)
-  ← registerSimplePersistentEnvExtension fooInstDecsr
-
--- Now, we need to specify how the extension actually behaves from Lean syntax.
-
-initialize registerBuiltinAttribute {
-  name := `addFooInst
-  descr := "Something silly ."
-  applicationTime := .afterTypeChecking
-  add := fun declName stx _ => do
-    let `(attr| foobar ) := stx
-      | throwError "syntax error on : {stx}"
-    MetaM.run' do
-    -- get the current environment, look for the declaration which was tagged
-          let e ← getEnv
-          match e.find? declName with
-          | none => logError m!"[@foobar] error: could not find declaration {declName} in environment"
-          | some info => -- if found, update the extension
-            modifyEnv fun env =>
-                fooExtension.addEntry env info.type
-  }
-
-syntax "#showFoo" : command
-elab "#showFoo" : command => do
-  logInfo "Printing types of declarations tagged by @[foobar]:"
-  let decls := fooExtension.getState <| ← getEnv
-  for x in decls do
-    logInfo m!"{x}"
-  return ()
-
-
--- END OF EXAMPLE
-
 -- Our data type for holding information on theorem declarations.
 structure ThmData where
-  -- Name of the theorem
   name : Name
-  -- List of param_name × param_type
   params : List (Name × Name)
-  -- LHS of the IFF
   lhs : Lean.Expr
-  -- RHS of the IFF
   rhs : Lean.Expr
-  -- The body of the theorem
   prf : Lean.Expr
   deriving BEq, Hashable
 
@@ -130,3 +76,47 @@ elab "#show_parity" : command => do
   for x in decls do
     logInfo m!"---\nname: {x.name}\nparams: {x.params}\nlhs: {x.lhs}\nrhs: {x.rhs}\nprf: {x.prf}"
   return ()
+
+def addVar (v : Expr) (arr : Array (Name × Expr)) : MetaM (Array (Name × Expr)) := do
+    let τ ← inferType v
+    match v with
+    | .fvar v =>
+      let nm ←  v.getUserName
+      return arr.push (nm,τ)
+    | _ => return arr
+
+def collectBvars (es : Array Expr) (e : Expr) : MetaM ((Array (Name × Expr)) × Expr) := do
+  let mut arr : Array (Name × Expr) := #[]
+  for v in es do
+    arr ← addVar v arr
+  return (arr, e)
+
+-- Given `expr`, rewrite occurrences of `old` with `new`.
+partial def rewrite_occurrences (old : Expr) (new : Expr) (expr : Expr) : MetaM Expr := do
+  if (<- Lean.Meta.isExprDefEq old expr) then
+    return new
+  else
+    let (_, e) ← forallTelescopeReducing expr (λ es e => collectBvars es e)
+    match e.getAppFn with
+    | .const `Iff _ =>
+      let args := e.getAppArgs
+      let lhs := args[0]!
+      let rhs := args[1]!
+      let new_lhs <- rewrite_occurrences old new lhs
+      let new_rhs <- rewrite_occurrences old new rhs
+      return (Expr.app (Expr.app (Expr.const `Iff []) new_lhs) new_rhs)
+    | .const `And _ =>
+      let args := e.getAppArgs
+      let lhs := args[0]!
+      let rhs := args[1]!
+      let new_lhs <- rewrite_occurrences old new lhs
+      let new_rhs <- rewrite_occurrences old new rhs
+      return (Expr.app (Expr.app (Expr.const `And []) new_lhs) new_rhs)
+    | .const `Or _ =>
+      let args := e.getAppArgs
+      let lhs := args[0]!
+      let rhs := args[1]!
+      let new_lhs <- rewrite_occurrences old new lhs
+      let new_rhs <- rewrite_occurrences old new rhs
+      return (Expr.app (Expr.app (Expr.const `Or []) new_lhs) new_rhs)
+    | _ => return expr
