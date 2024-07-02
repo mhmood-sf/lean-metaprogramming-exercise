@@ -1,15 +1,14 @@
 import Lean
-import Lake
+import Warmup.Scratch
 
 open Lean Elab Command Tactic Meta
-
-def foldArrayIntoSet [BEq α] [Hashable α] (s : HashSet α) (a : Array α) : HashSet α :=
-  a.foldl HashSet.insert s
 
 -- Our data type for holding information on theorem declarations.
 structure ThmData where
   name : Name
-  params : List (Name × Name)
+  -- List of param_name × param_type
+  params : Array (Name × Expr)
+  -- LHS of the IFF
   lhs : Lean.Expr
   rhs : Lean.Expr
   prf : Lean.Expr
@@ -39,14 +38,43 @@ def parseVal (params : List (Name × Name)) (body : Expr) : List (Name × Name) 
   | Expr.lam name (.const type _) body _ => parseVal ((name, type) :: params) body
   | _ => (params, body)
 
-def matchThm (thm : TheoremVal) : Option ThmData := do
-  let (params, prf) := parseVal [] thm.value
-  match parseType thm with
-  | some (lhs, rhs) => pure { name := thm.name, params := params, lhs := lhs, rhs := rhs, prf := prf }
-  | none => none
+-- def matchThm (thm : TheoremVal) : Option ThmData := do
+--   let (params, prf) := parseVal [] thm.value
+--   match parseType thm with
+--   | some (lhs, rhs) => pure { name := thm.name, params := params, lhs := lhs, rhs := rhs, prf := prf }
+--   | none => none
+
+def addVar (v : Expr) (arr : Array (Name × Expr)) : MetaM (Array (Name × Expr)) := do
+    let τ ← inferType v
+    match v with
+    | .fvar v =>
+      let nm ←  v.getUserName
+      return arr.push (nm,τ)
+    | _ => return arr
+
+def collectBvars (es : Array Expr) (e : Expr) : MetaM ((Array (Name × Expr)) × Expr) := do
+  let mut arr : Array (Name × Expr) := #[]
+  for v in es do
+    arr ← addVar v arr
+  return (arr, e)
+
+
+/- Note! -/
+def matchIffThm' (thm : TheoremVal) : MetaM (Option ThmData) := do
+  logInfo thm.type
+  -- note, in general this telescope will also collect premises of implications
+  let (bvars,e) ← forallTelescopeReducing thm.type (λ es e => collectBvars es e)
+  match e.getAppFn with
+  | .const `Iff _ =>
+    let args := e.getAppArgs
+    let lhs := args[0]!
+    let rhs := args[1]!
+    return some { name := thm.name, params := bvars, lhs := lhs, rhs := rhs, prf := thm.value}
+  | _ =>
+    return none
 
 def addThmToEnv (thm : TheoremVal) : MetaM Unit := do
-  match matchThm thm with
+  match ← matchIffThm' thm with
   | some thmData => modifyEnv fun env => parityExtension.addEntry env thmData
   | none => logError m!"Not an iff theorem."
 
@@ -65,35 +93,26 @@ initialize registerBuiltinAttribute {
           | some info => -- if found, update the extension
             match info with
             --| ConstantInfo.thmInfo thm => addThmToEnv thm
-            | ConstantInfo.thmInfo thm => logInfo m!"name: {thm.name}\nparams+prf: {parseVal [] thm.value}\ntype: {thm.type}"
+            | ConstantInfo.thmInfo thm =>
+                  logInfo m!"name: {thm.name}\nparams+prf: {parseVal [] thm.value}\ntype: {thm.type}"
+                  addThmToEnv thm
             | _ => logError m!"Not a theorem declaration."
 
   }
 
 syntax "#show_parity" : command
 elab "#show_parity" : command => do
+  logInfo "showing parity..."
   let decls := parityExtension.getState <| ← getEnv
   for x in decls do
     logInfo m!"---\nname: {x.name}\nparams: {x.params}\nlhs: {x.lhs}\nrhs: {x.rhs}\nprf: {x.prf}"
   return ()
 
-def addVar (v : Expr) (arr : Array (Name × Expr)) : MetaM (Array (Name × Expr)) := do
-    let τ ← inferType v
-    match v with
-    | .fvar v =>
-      let nm ←  v.getUserName
-      return arr.push (nm,τ)
-    | _ => return arr
-
-def collectBvars (es : Array Expr) (e : Expr) : MetaM ((Array (Name × Expr)) × Expr) := do
-  let mut arr : Array (Name × Expr) := #[]
-  for v in es do
-    arr ← addVar v arr
-  return (arr, e)
-
 -- Given `expr`, rewrite occurrences of `old` with `new`.
+-- TODO: 1. doesn't work, 2. how do I handle the unknown fvar from the tagged theorem definition?
 partial def rewrite_occurrences (old : Expr) (new : Expr) (expr : Expr) : MetaM Expr := do
-  if (<- Lean.Meta.isExprDefEq old expr) then
+  -- logInfo m!"old: {old}, new: {new}, expr: {expr}"
+  if old == expr then
     return new
   else
     let (_, e) ← forallTelescopeReducing expr (λ es e => collectBvars es e)
